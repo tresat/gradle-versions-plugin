@@ -16,6 +16,7 @@ import org.gradle.api.artifacts.DependencyConstraint
 import org.gradle.api.artifacts.ExternalDependency
 import org.gradle.api.artifacts.ModuleDependency
 import org.gradle.api.artifacts.ModuleVersionIdentifier
+import org.gradle.api.artifacts.ResolutionStrategy
 import org.gradle.api.artifacts.ResolvedDependency
 import org.gradle.api.artifacts.UnresolvedDependency
 import org.gradle.api.artifacts.repositories.ArtifactRepository
@@ -26,12 +27,15 @@ import org.gradle.api.artifacts.result.ResolvedArtifactResult
 import org.gradle.api.attributes.Attribute
 import org.gradle.api.attributes.HasConfigurableAttributes
 import org.gradle.api.attributes.java.TargetJvmVersion
+import org.gradle.api.internal.artifacts.DefaultExcludeRule
 import org.gradle.api.internal.artifacts.DefaultModuleVersionIdentifier
 import org.gradle.api.internal.artifacts.dependencies.DefaultProjectDependencyConstraint
+import org.gradle.api.internal.artifacts.dependencies.DependencyConstraintInternal
 import org.gradle.api.specs.Specs.SATISFIES_ALL
 import org.gradle.internal.component.external.model.DefaultModuleComponentIdentifier
 import org.gradle.maven.MavenModule
 import org.gradle.maven.MavenPomArtifact
+import org.gradle.util.GradleVersion
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
@@ -83,11 +87,111 @@ class Resolver(
     return result
   }
 
+  /**
+   * Copies the relevant parts of a configuration necessary for the plugin to function.
+   *
+   * This includes resolutionStrategy, artifacts, attributes, excludeRules and of course all
+   * dependencies and constraints declared anywhere in the configuration's hierarchy.  It also ensures all dependencyActions
+   * are run prior to iterating through dependencies and constraints.  Some of this is probably unnecessary, but this
+   * should ensure this externalized copy method behaves the same as the to be deprecated [Configuration#copyRecursive()]
+   * method.
+   *
+   * This uses a detached configuration, to hide the copy from the configuration hierarchy and any configuration-based
+   * reporting which might be present in the build.
+   *
+   * If Gradle 8.1 or earlier, this just forwards to the [Configuration#copyRecursive()] method.  That method is deprecated
+   * in Gradle 8.2.  If using later versions will externalize the copy logic here using some newer API.
+   *
+   * @param source the configuration to copy
+   * @return a copy of the configuration, with the same relevant statuses, artifacts, attributes,
+   *  exclude rules, and dependencies
+   */
+  private fun copyConfiguration(source: Configuration): Configuration {
+    if (GradleVersion.current() < GradleVersion.version("8.2")) {
+      return source.copyRecursive()
+    }
+
+    val copy = project.configurations.detachedConfiguration()
+
+    // Force initialization of the collections via running actions prior to setting the copy's state
+    val allSourceDeps = source.dependencies
+    val allSourceConstraints = source.dependencyConstraints
+
+    copy.setVisible(source.isVisible)
+    copy.setTransitive(source.isTransitive)
+
+    // TODO: Replace with public API for this in Gradle >= 8.2
+    copyResolutionStrategy(source, copy)
+
+    // TODO: Uncomment to call public API for this in Gradle >= 8.2 (even though it doesn't seem to matter for this plugin)
+    // copy.addDependencyResolutionListeners(source.getDependencyResolutionListeners())
+
+    copy.artifacts.addAll(source.allArtifacts)
+
+    source.attributes.keySet().forEach { attr ->
+      val value = source.attributes.getAttribute(attr) ?: throw IllegalStateException("Attribute $attr not found!")
+      copy.attributes.attribute(org.gradle.internal.Cast.uncheckedNonnullCast(attr), value)
+    }
+
+    // There's no allExcludeRules, so have to walk the hierarchy manually
+    source.hierarchy.forEach { currSource ->
+      currSource.excludeRules.forEach { rule -> copy.excludeRules.add(DefaultExcludeRule(rule.group, rule.module)) }
+    }
+
+    allSourceDeps.forEach { dep -> copy.dependencies.add(dep.copy()) }
+    allSourceConstraints.forEach { con -> copy.dependencyConstraints.add((con as DependencyConstraintInternal).copy()) }
+
+    return copy
+  }
+
+  /**
+   * Copies the resolution strategy from the source configuration to the target configuration.
+   *
+   * This uses reflection a workaround for the fact that the public API for this is not yet available.  It should be added in
+   * Gradle 8.2, after which this can be replaced with a straightforward call to a setter in the public API.
+   *
+   * @param source the configuration to copy the resolution strategy from
+   * @param target the configuration to copy the resolution strategy to
+   */
+  private fun copyResolutionStrategy(source: Configuration, target: Configuration) {
+    val metaClass = getMetaClass(source)
+    val property = metaClass.hasProperty(source, "resolutionStrategy")
+    if (property != null) {
+      val resolutionStrategyOriginal: ResolutionStrategy = (property.getProperty(source) as ResolutionStrategy)
+      val resolutionStrategyCopy = getMetaClass(resolutionStrategyOriginal).invokeMethod(resolutionStrategyOriginal, "copy", null)
+
+      // Have to set via field reflection since there is no setter method = not a property
+      val defaultConfigurationClass = if (target.javaClass.name == "org.gradle.api.internal.artifacts.configurations.DefaultConfiguration") { target.javaClass } else { target.javaClass.superclass }
+      defaultConfigurationClass.getDeclaredField("resolutionStrategy").let { field ->
+        field.isAccessible = true
+        field.set(target, resolutionStrategyCopy)
+      }
+    }
+  }
+
+  /**
+   * Sets the resolution strategy on the given configuration to not fail on dynamic versions.
+   *
+   * Previously, there was a bug in the logic now present in this method, where it would never run the update, since the
+   * if check would always return false.
+   *
+   * @param configuration the configuration to update
+   */
+  private fun setDontFailOnDynamicVersions(configuration: Configuration) {
+    // https://github.com/ben-manes/gradle-versions-plugin/issues/592
+    // allow resolution of dynamic latest versions regardless of the original strategy
+    val resolutionStrategyClass = getMetaClass(configuration.resolutionStrategy)
+    val property = resolutionStrategyClass.hasProperty(configuration.resolutionStrategy, "failOnDynamicVersions")
+    if (asBoolean(property)) {
+      resolutionStrategyClass.setProperty(configuration.resolutionStrategy, "failOnDynamicVersions", false)
+    }
+  }
+
   /** Returns a copy of the configuration where dependencies will be resolved up to the revision.  */
   private fun createLatestConfiguration(
     configuration: Configuration,
     revision: String,
-    currentCoordinates: Map<Coordinate.Key, Coordinate>,
+    currentCoordinates: Map<Coordinate.Key, Coordinate>
   ): Configuration {
     val latest = configuration.allDependencies
       .filterIsInstance<ExternalDependency>()
@@ -105,18 +209,9 @@ class Resolver(
       }
     }
 
-    val copy = configuration.copyRecursive().setTransitive(false)
+    val copy = copyConfiguration(configuration).setTransitive(false)
 
-    // https://github.com/ben-manes/gradle-versions-plugin/issues/592
-    // allow resolution of dynamic latest versions regardless of the original strategy
-    if (asBoolean(
-        getMetaClass(copy.resolutionStrategy)
-          .hasProperty(copy.resolutionStrategy, "failOnDynamicVersions")
-      )
-    ) {
-      getMetaClass(copy.resolutionStrategy)
-        .setProperty(copy.resolutionStrategy, "failOnDynamicVersions", false)
-    }
+    setDontFailOnDynamicVersions(copy)
 
     // Resolve using the latest version of explicitly declared dependencies and retains Kotlin's
     // inherited stdlib dependencies from the super configurations. This is required for variant
